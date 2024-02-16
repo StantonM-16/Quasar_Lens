@@ -1,0 +1,627 @@
+############
+#  Set-Up  #
+############
+import numpy as np
+import astropy.units as u
+from astropy.cosmology import FlatLambdaCDM
+from scipy.integrate import quad
+from scipy.integrate import dblquad
+import matplotlib.pyplot as plt
+import sympy as sp
+from time import time
+start_time = time()
+
+######################
+#  Class Definition  #
+######################
+
+class Quasar_Lens():
+     def __init__(self, zs, Mlim, prob_dist='total', H0=70, OM0=0.3, sigma0='172.2 * (1+z)**0.18', phi0 = '6.917933918e-3 * (1+z)**-1.18', a=-0.15, b=2.35, alpha=-1.3, beta=-2.6, Ms=-25, Phis=10.9e-9, mu_min=2, K_correc=-2.306):
+         if prob_dist == 'bright':
+             self.prob_dist = 'bright'
+         else:
+             self.prob_dist = 'total'
+         self.zs = zs
+         self.Mlim = Mlim
+         # Cosmology Parameters
+         self.H0 = H0
+         self.OM0 = OM0
+         # Allow the class to take phi star and sigma star values that are functions of redshift
+         self.z = sp.symbols('z')
+         self.phi0 = sp.lambdify(self.z, sp.sympify(phi0), 'numpy')
+         self.sigma0 = sp.lambdify(self.z, sp.sympify(sigma0), 'numpy')
+         # Remaining vdf parameters
+         self.a = a
+         self.b = b
+         # QLF parameters
+         self.alpha = alpha
+         self.beta = beta
+         self.Ms = Ms
+         self.Phis = Phis
+         self.mu_min = mu_min
+         # Define the cosmology to be worked with
+         self.cosmo = FlatLambdaCDM(H0, OM0)
+         # Conversion to absolute magnitude given apparent magnitude input
+         self.K_correc = K_correc
+         if self.Mlim > 0:
+             self.Mlim = self.Mlim - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - self.K_correc
+         
+     ##################################
+     #  Lensing Optical Depth Method  #
+     ##################################   
+     
+     # Function to define integrand that will be fed into integration function
+     def tau_integrand(self, sigma, z):
+         # Ensures that the range of redshift values entered is appropriate
+         # to avoid division by zero or bugged integration
+         if z>self.zs:
+             return 0
+         if z<=0:
+             print("Please enter a valid range of redshift values (must be strictly greater than 0)")
+
+         vdf = self.phi0(z) * (sigma / self.sigma0(z)) ** self.a * np.exp(-(sigma / self.sigma0(z))**self.b) * 1/(sigma)
+         
+         dV = self.cosmo.differential_comoving_volume(z).value
+         
+         theta_E = 4 * np.pi * (sigma/3e5)**2 * self.cosmo.angular_diameter_distance_z1z2(z,self.zs) / self.cosmo.angular_diameter_distance(self.zs)
+         
+         tau_integral = vdf * dV * np.pi * theta_E**2
+         
+         return tau_integral
+     
+     # Function to perform the double integration over zs and sigma,
+     # and thus compute the lensing optical depth
+     def tau_m(self):
+         integral = dblquad(self.tau_integrand, 0, self.zs, 0, 1000)
+         # Note that the upper sigma bound of 1000 is slightly excessive and performance 
+         # could be improved by lowering this to ~750 with minimal effect in most cases
+         return integral[0]
+     
+     ###############################
+     #  Magnification Bias Method  #
+     ###############################
+     
+     # Define the probability distribution of magnification of lensed sources,
+     # depending on whether the lensed images can be seperately resolved in the 
+     # survey ('bright') or not('total')
+     def prob_dist_func(self, mu):
+         if self.prob_dist == 'bright':
+             return 2 / (mu - 1)**3
+         if self.prob_dist == 'total':
+             return 8 / mu**3
+     
+     # Define the QLF, using the double power law defined as in Yue et al. (2021)
+     def qlf(self, M):
+         qlf_integral = self.Phis / (10**(0.4*(self.alpha + 1)*(M - self.Ms))+(10**(0.4*(self.beta + 1)*(M - self.Ms))))
+         return qlf_integral
+     
+     def qlf_int(self, mu, m):
+         Phi_int = quad(self.qlf, -40, m(mu))
+         return Phi_int[0]
+     
+     def numer_integrand(self, mu, m):
+         numer_integral = self.qlf_int(mu, m) * self.prob_dist_func(mu)
+         return numer_integral
+     
+     def numer(self, m_func):
+         numer_int = quad(lambda mu: self.numer_integrand(mu, m_func), self.mu_min, np.infty)
+         return numer_int[0]
+     
+     def m_function(self, mu):
+         return self.Mlim + 2.5 * np.log10(mu)
+     
+     def numerator(self):
+         return self.numer(self.m_function)
+     
+     def denominator(self):
+         denom_int = quad(self.qlf, -40, self.Mlim)
+         return denom_int[0]
+     
+     def B(self):
+         return self.numerator()/self.denominator()
+         
+     ###################################
+     #  Probability of Lensing Method  #   
+     ###################################
+     
+     def prob_lens(self,B_dash=1):
+         return (self.B()*self.tau_m())/(self.B()*self.tau_m()+B_dash*(1-self.tau_m()))
+
+     ####################################
+     #  Graphing Lensing Optical Depth  #
+     ####################################
+
+     # Standard Scale
+     def tau_m_graph(self, var_min, var_max, variable='zs', scale='standard', secondary_variable='none', secondary_variable_values=[]):
+          # Create an array of values given the desired minimum and maximum values
+          var_values = np.linspace(var_min, var_max, 100)
+          
+          # Create a dictionary assigning each variable input to its instance
+          # value within the class, which will then be overwritten for chosen variables
+          default_values = {
+         'zs': self.zs,
+         'Mlim': self.Mlim,
+         'prob_dist': self.prob_dist,
+         'H0': self.H0,
+         'OM0': self.OM0,
+         'sigma0': self.sigma0(self.z),
+         'phi0': self.phi0(self.z),
+         'a': self.a,
+         'b': self.b,
+         'alpha': self.alpha,
+         'beta': self.beta,
+         'Ms': self.Ms,
+         'Phis': self.Phis,
+         'mu_min': self.mu_min,
+         'K_correc': self.K_correc
+         }
+         
+          # Define the full variable names for labelling the axis
+          if variable == 'zs':
+              var_name = 'Redshift'
+          elif variable == 'H0':
+              var_name = 'Hubble Constant'
+          elif variable == 'OM0':
+              var_name = 'Omega Matter Density'
+          elif variable == 'sigma0':
+              var_name = 'Sigma Star'
+          elif variable == 'phi0':
+              var_name = 'Phi Star'
+          elif variable == 'a':
+              var_name = 'a-parameter'
+          elif variable == 'b':
+              var_name = 'b-parameter'  
+          else:
+              print("Please enter valid variable name")
+          
+    
+          # Initialize list to store quasar lens initialisations
+          quasar_lenses_tau = []
+          
+          
+          if secondary_variable != 'none':
+              for sec_var_value in secondary_variable_values:
+                  one_sec_var = []
+                  default_values[secondary_variable] = sec_var_value
+                  for var_value in var_values:
+                      default_values[variable] = var_value
+                      kwargs = default_values.copy()
+                      quasar_lens_instance = Quasar_Lens(**kwargs)
+                      one_sec_var.append(quasar_lens_instance)
+                  quasar_lenses_tau.append(one_sec_var)
+          else:
+              one_sec_var = []
+              for var_value in var_values:
+                  default_values[variable] = var_value
+                  kwargs = default_values.copy()
+                  quasar_lens_instance = Quasar_Lens(**kwargs)
+                  one_sec_var.append(quasar_lens_instance)
+              quasar_lenses_tau.append(one_sec_var)
+          #print(quasar_lenses_tau)
+              
+          tau_m_values = []
+          temp1 = 0
+          for j in quasar_lenses_tau:
+              tau_m_values.append([quasar_lens.tau_m() for quasar_lens in quasar_lenses_tau[temp1]])
+              temp1+=1
+          #print(tau_m_values)
+          # Plot the results
+          temp2 = 0
+          if len(secondary_variable_values)==0:
+              secondary_variable_values = ['empty']
+              
+          for k in tau_m_values:
+              if scale == 'standard':
+                  plt.plot(var_values, tau_m_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                  plt.xlabel('{} ({})'.format(var_name, variable))
+                  plt.ylabel('Lensing Optical Depth (tau_m)')
+                  plt.title('Lensing Optical Depth vs {}'.format(var_name))
+                  temp2+=1
+              elif scale == 'log':
+                  plt.plot(var_values, np.log(tau_m_values[temp2]), label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                  plt.xlabel('{} ({})'.format(var_name, variable))
+                  plt.ylabel('log(Lensing Optical Depth) (log(tau_m))')
+                  plt.title('Lensing Optical Depth vs {} on a log scale'.format(var_name))
+                  temp2+=1
+              elif scale == 'log vs log':
+                  if any(val<=0 for val in var_values):
+                      print("log scale cannot be used when independent variable takes non-positive values")
+                  else:
+                      plt.plot(np.log(var_values), np.log(tau_m_values[temp2]), label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                      plt.xlabel('log({}) (log({}))'.format(var_name, variable))
+                      plt.ylabel('log(Lensing Optical Depth) (log(tau_m))')
+                      plt.title('log(Lensing Optical Depth) vs log({})'.format(var_name))
+                      temp2+=1
+              else:
+                  print("Please enter a valid scale ('standard', 'log' or 'log vs log')")
+                  return
+          if not(secondary_variable_values == ['empty']):
+              plt.legend()
+          return plt.show()
+     
+        
+     
+     #####################################
+     #  Graphing Magnification Bias (B)  #
+     #####################################
+
+     # Standard Scale
+     def B_graph(self, var_min, var_max, variable='Mlim', scale='standard', secondary_variable='none', secondary_variable_values=[]):
+              # Create an array of values given the desired minimum and maximum values
+              var_values = [np.linspace(var_min, var_max, 100)]
+              app_variable = ''
+              app_secondary_variable = ''
+              
+              default_values = {
+             'zs': self.zs,
+             'Mlim': self.Mlim,
+             'prob_dist': self.prob_dist,
+             'H0': self.H0,
+             'OM0': self.OM0,
+             'sigma0': self.sigma0,
+             'phi0': self.phi0,
+             'a': self.a,
+             'b': self.b,
+             'alpha': self.alpha,
+             'beta': self.beta,
+             'Ms': self.Ms,
+             'Phis': self.Phis,
+             'mu_min': self.mu_min,
+             'K_correc': self.K_correc
+             }
+             
+              if variable == 'Mlim' or variable == 'mlim':
+                  if var_max > 0:
+                      var_name = "Apparent Limiting Magnitude"
+                      app_variable = 'mlim'
+                      variable = 'Mlim'
+                      app_var_values = var_values
+                      #abs_var_values = np.linspace(var_min, var_max, 100)
+                      if secondary_variable == 'K_correc':
+                          var_values = []
+                          for correc in secondary_variable_values:
+                              absolute_max = var_max - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - correc
+                              absolute_min = var_min - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - correc
+                              correc_array = np.linspace(absolute_min, absolute_max, 100)
+                              var_values.append(correc_array)
+                      elif secondary_variable == 'zs': 
+                          var_values = []
+                          for z in secondary_variable_values:
+                              absolute_max = var_max - 5 * np.log10(self.cosmo.luminosity_distance(z).value * 10**6) + 5 - self.correc
+                              absolute_min = var_min - 5 * np.log10(self.cosmo.luminosity_distance(z).value * 10**6) + 5 - self.correc
+                              z_array = np.linspace(absolute_min, absolute_max, 100)
+                              var_values.append(z_array)
+                      else:
+                          absolute_max = var_max - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - self.K_correc
+                          absolute_min = var_min - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - self.K_correc
+                          var_values = [np.linspace(absolute_min, absolute_max, 100)]
+                  else:
+                      var_name = "Absolute Limiting Magnitude"
+                      variable = 'Mlim'        
+              elif variable == 'alpha':
+                  var_name = 'Faint-End Slope'
+              elif variable == 'beta':
+                  var_name = 'Bright-End Slope'
+              elif variable == 'Ms':
+                  var_name = 'Break Magnitude'
+              elif variable == 'mu_min':
+                  var_name = 'Minimum Magnification'  
+              else:
+                  print("Please enter valid variable name")
+              
+                
+        
+              # Initialize lists to store quasar lens initialisations
+              B_values = []
+              
+              if secondary_variable != 'none':
+                  if len(var_values) > 1:
+                      temp1 = 0
+                      for sec_var_value in secondary_variable_values:
+                          default_values[secondary_variable] = sec_var_value
+                          temp_list_1 = []
+                          for var_value in var_values[temp1]:
+                              default_values[variable] = var_value
+                              kwargs = default_values.copy()
+                              quasar_lens_instance = Quasar_Lens(**kwargs)
+                              B_quasar_lens_instance = quasar_lens_instance.B()
+                              temp_list_1.append(B_quasar_lens_instance) 
+                          B_values.append(temp_list_1)
+                          temp1+=1
+                  elif secondary_variable == 'mlim':
+                      app_secondary_variable = 'mlim'
+                      secondary_variable = 'Mlim'
+                      for sec_var_value in secondary_variable_values:
+                          default_values[secondary_variable] = sec_var_value
+                          temp_list_1 = []
+                          for var_value in var_values[0]:
+                              default_values[variable] = var_value
+                              kwargs = default_values.copy()
+                              quasar_lens_instance = Quasar_Lens(**kwargs)
+                              B_quasar_lens_instance = quasar_lens_instance.B()
+                              temp_list_1.append(B_quasar_lens_instance) 
+                          B_values.append(temp_list_1)
+                  else:
+                      for sec_var_value in secondary_variable_values:
+                          default_values[secondary_variable] = sec_var_value
+                          temp_list_1 = []
+                          for var_value in var_values[0]:
+                              default_values[variable] = var_value
+                              kwargs = default_values.copy()
+                              quasar_lens_instance = Quasar_Lens(**kwargs)
+                              B_quasar_lens_instance = quasar_lens_instance.B()
+                              temp_list_1.append(B_quasar_lens_instance) 
+                          B_values.append(temp_list_1)
+                          
+              else:
+                  temp_list_1 = []
+                  for var_value in var_values[0]:
+                      default_values[variable] = var_value
+                      kwargs = default_values.copy()
+                      quasar_lens_instance = Quasar_Lens(**kwargs)
+                      B_quasar_lens_instance = quasar_lens_instance.B()
+                      temp_list_1.append(B_quasar_lens_instance)
+                  B_values.append(temp_list_1)
+
+              # Plot the results
+              if len(secondary_variable_values)==0:
+                  secondary_variable_values = ['empty']
+              temp2 = 0    
+              for k in B_values:
+                      if scale == 'standard':
+                          if app_variable == 'mlim':
+                              plt.plot(app_var_values[0], B_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                              plt.xlabel('{} ({})'.format(var_name, app_variable))
+                              plt.ylabel('Magnification Bias (B)')
+                              plt.title('Magnification Bias vs {}'.format(var_name))
+                          else:
+                              if app_secondary_variable == 'mlim':
+                                  plt.plot(var_values[0], B_values[temp2], label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                              else:
+                                  plt.plot(var_values[0], B_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                              plt.xlabel('{} ({})'.format(var_name, variable))
+                              plt.ylabel('Magnification Bias (B)')
+                              plt.title('Magnification Bias vs {}'.format(var_name))
+                      
+                      elif scale == 'log':
+                          if app_variable == 'mlim':
+                              plt.plot(np.log(app_var_values[0]), B_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                              plt.xlabel('{} ({})'.format(var_name, app_variable))
+                              plt.ylabel('log(Magnification Bias) (log(B))')
+                              plt.title('Magnification Bias vs {} on a log scale'.format(var_name))
+                          else:
+                              if app_secondary_variable == 'mlim':
+                                  plt.plot(np.log(var_values[0]), B_values[temp2], label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                              else:
+                                  plt.plot(np.log(var_values[0]), B_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                              plt.xlabel('{} ({})'.format(var_name, variable))
+                              plt.ylabel('log(Magnification Bias) (log(B))')
+                              plt.title('Magnification Bias vs {} on a log scale'.format(var_name))
+
+                      elif scale == 'log vs log':
+                          if app_variable == 'mlim':
+                              plt.plot(np.log(app_var_values[0]), np.log(B_values[temp2]), label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                              plt.xlabel('log({}) (log({}))'.format(var_name, app_variable))
+                              plt.ylabel('log(Magnification Bias) (log(B))')
+                              plt.title('log(Magnification Bias) vs log({})'.format(var_name))
+                          else:
+                              if any(val<=0 for val in var_values):
+                                  print("log scale cannot be used when independent variable takes non-positive values")
+                                  return
+                              else:    
+                                  if app_secondary_variable == 'mlim':
+                                      plt.plot(np.log(var_values[0]), np.log(B_values[temp2]), label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                                  else:
+                                      plt.plot(np.log(var_values[0]), np.log(B_values[temp2]), label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                                  plt.xlabel('log({}) (log({}))'.format(var_name, variable))
+                                  plt.ylabel('log(Magnification Bias) (log(B))')
+                                  plt.title('log(Magnification Bias) vs log({})'.format(var_name))
+                      else:
+                          print("Please enter a valid scale ('standard', 'log' or 'log vs log')")
+                          return
+                      temp2+=1
+              if not(secondary_variable_values == ['empty']):
+                  plt.legend()
+              return plt.show()
+
+
+     #####################################
+     #  Graphing Probability of Lensing  #
+     #####################################
+
+     # Standard Scale
+     def prob_lens_graph(self, var_min, var_max, variable='zs', scale='standard', secondary_variable='none', secondary_variable_values=[]):
+          # Create an array of values given the desired minimum and maximum values
+          var_values = [np.linspace(var_min, var_max, 100)]
+          app_variable = ''
+          app_secondary_variable = ''
+          
+          default_values = {
+         'zs': self.zs,
+         'Mlim': self.Mlim,
+         'prob_dist': self.prob_dist,
+         'H0': self.H0,
+         'OM0': self.OM0,
+         'sigma0': self.sigma0(self.z),
+         'phi0': self.phi0(self.z),
+         'a': self.a,
+         'b': self.b,
+         'alpha': self.alpha,
+         'beta': self.beta,
+         'Ms': self.Ms,
+         'Phis': self.Phis,
+         'mu_min': self.mu_min,
+         'K_correc': self.K_correc
+         }
+         
+          if variable == 'Mlim' or variable == 'mlim':
+              if var_max > 0:
+                  var_name = "Apparent Limiting Magnitude"
+                  app_variable = 'mlim'
+                  variable = 'Mlim'
+                  app_var_values = var_values
+                  #abs_var_values = np.linspace(var_min, var_max, 100)
+                  if secondary_variable == 'K_correc':
+                      var_values = []
+                      for correc in secondary_variable_values:
+                          absolute_max = var_max - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - correc
+                          absolute_min = var_min - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - correc
+                          correc_array = np.linspace(absolute_min, absolute_max, 100)
+                          var_values.append(correc_array)
+                  elif secondary_variable == 'zs': 
+                      var_values = []
+                      for z in secondary_variable_values:
+                          absolute_max = var_max - 5 * np.log10(self.cosmo.luminosity_distance(z).value * 10**6) + 5 - self.correc
+                          absolute_min = var_min - 5 * np.log10(self.cosmo.luminosity_distance(z).value * 10**6) + 5 - self.correc
+                          z_array = np.linspace(absolute_min, absolute_max, 100)
+                          var_values.append(z_array)
+                  else:
+                      absolute_max = var_max - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - self.K_correc
+                      absolute_min = var_min - 5 * np.log10(self.cosmo.luminosity_distance(self.zs).value * 10**6) + 5 - self.K_correc
+                      var_values = [np.linspace(absolute_min, absolute_max, 100)]
+              else:
+                  var_name = "Absolute Limiting Magnitude"
+                  variable = 'Mlim' 
+          elif variable == 'alpha':
+              var_name = 'Faint-End Slope'
+          elif variable == 'beta':
+              var_name = 'Bright-End Slope'
+          elif variable == 'Ms':
+              var_name = 'Break Magnitude'
+          elif variable == 'mu_min':
+              var_name = 'Minimum Magnification' 
+          elif variable == 'zs':
+              var_name = 'Redshift'
+          elif variable == 'H0':
+              var_name = 'Hubble Constant'
+          elif variable == 'OM0':
+              var_name = 'Omega Matter Density'
+          elif variable == 'sigma0':
+              var_name = 'Sigma Star'
+          elif variable == 'phi0':
+              var_name = 'Phi Star'            
+          elif variable == 'a':
+              var_name = 'a-parameter'
+          elif variable == 'b':
+              var_name = 'b-parameter'
+          elif variable == 'K_correc':
+              var_name = 'K-correction'
+              
+          else:
+              print("Please enter valid variable name")
+              return
+          
+    
+          # Initialize lists to store quasar lens initialisations
+          prob_lens_values = []
+          
+          if secondary_variable != 'none':
+              if len(var_values) > 1:
+                  temp1 = 0
+                  for sec_var_value in secondary_variable_values:
+                      default_values[secondary_variable] = sec_var_value
+                      temp_list_1 = []
+                      for var_value in var_values[temp1]:
+                          default_values[variable] = var_value
+                          kwargs = default_values.copy()
+                          quasar_lens_instance = Quasar_Lens(**kwargs)
+                          prob_lens_quasar_lens_instance = quasar_lens_instance.prob_lens()
+                          temp_list_1.append(prob_lens_quasar_lens_instance) 
+                      prob_lens_values.append(temp_list_1)
+                      temp1+=1
+              elif secondary_variable == 'mlim':
+                  app_secondary_variable = 'mlim'
+                  secondary_variable = 'Mlim'
+                  for sec_var_value in secondary_variable_values:
+                      default_values[secondary_variable] = sec_var_value
+                      temp_list_1 = []
+                      for var_value in var_values[0]:
+                          default_values[variable] = var_value
+                          kwargs = default_values.copy()
+                          quasar_lens_instance = Quasar_Lens(**kwargs)
+                          prob_lens_quasar_lens_instance = quasar_lens_instance.prob_lens()
+                          temp_list_1.append(prob_lens_quasar_lens_instance) 
+                      prob_lens_values.append(temp_list_1)
+              else:
+                  for sec_var_value in secondary_variable_values:
+                      default_values[secondary_variable] = sec_var_value
+                      temp_list_1 = []
+                      for var_value in var_values[0]:
+                          default_values[variable] = var_value
+                          kwargs = default_values.copy()
+                          quasar_lens_instance = Quasar_Lens(**kwargs)
+                          prob_lens_quasar_lens_instance = quasar_lens_instance.prob_lens()
+                          temp_list_1.append(prob_lens_quasar_lens_instance) 
+                      prob_lens_values.append(temp_list_1)
+                      
+          else:
+              temp_list_1 = []
+              for var_value in var_values[0]:
+                  default_values[variable] = var_value
+                  kwargs = default_values.copy()
+                  quasar_lens_instance = Quasar_Lens(**kwargs)
+                  prob_lens_quasar_lens_instance = quasar_lens_instance.prob_lens()
+                  temp_list_1.append(prob_lens_quasar_lens_instance)
+              prob_lens_values.append(temp_list_1)       
+          
+
+          # Plot the results
+          if len(secondary_variable_values)==0:
+              secondary_variable_values = ['empty']
+          temp2 = 0    
+          for k in prob_lens_values:
+                  if scale == 'standard':
+                      if app_variable == 'mlim':
+                          plt.plot(app_var_values[0], prob_lens_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                          plt.xlabel('{} ({})'.format(var_name, app_variable))
+                          plt.ylabel('Probability of Lensing (prob_lens)')
+                          plt.title('Probability of Lensing vs {}'.format(var_name))
+                      else:
+                          if app_secondary_variable == 'mlim':
+                              plt.plot(var_values[0], prob_lens_values[temp2], label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                          else:
+                              plt.plot(var_values[0], prob_lens_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                          plt.xlabel('{} ({})'.format(var_name, variable))
+                          plt.ylabel('Probability of Lensing (prob_lens)')
+                          plt.title('Probability of Lensing vs {}'.format(var_name))
+                  
+                  elif scale == 'log':
+                      if app_variable == 'mlim':
+                          plt.plot(np.log(app_var_values[0]), prob_lens_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                          plt.xlabel('{} ({})'.format(var_name, app_variable))
+                          plt.ylabel('log(Probability of Lensing) (log(prob_lens))')
+                          plt.title('Probability of Lensing vs {} on a log scale'.format(var_name))
+                      else:
+                          if app_secondary_variable == 'mlim':
+                              plt.plot(np.log(var_values[0]), prob_lens_values[temp2], label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                          else:
+                              plt.plot(np.log(var_values[0]), prob_lens_values[temp2], label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                          plt.xlabel('{} ({})'.format(var_name, variable))
+                          plt.ylabel('log(Probability of Lensing) (log(prob_lens))')
+                          plt.title('Probability of Lensing vs {} on a log scale'.format(var_name))
+
+                  elif scale == 'log vs log':
+                      if app_variable == 'mlim':
+                          plt.plot(np.log(app_var_values[0]), np.log(prob_lens_values[temp2]), label='{} = {}'.format(secondary_variable,secondary_variable_values[temp2]))
+                          plt.xlabel('log({}) (log({}))'.format(var_name, app_variable))
+                          plt.ylabel('log(Probability of Lensing) (log(prob_lens))')
+                          plt.title('log(Probability of Lensing) vs log({})'.format(var_name))
+                      else:
+                          if any(val<=0 for val in var_values):
+                              print("log scale cannot be used when independent variable takes non-positive values")
+                              return
+                          else:    
+                              if app_secondary_variable == 'mlim':
+                                  plt.plot(np.log(var_values[0]), np.log(prob_lens_values[temp2]), label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                              else:
+                                  plt.plot(np.log(var_values[0]), np.log(prob_lens_values[temp2]), label='{} = {}'.format(app_secondary_variable,secondary_variable_values[temp2]))
+                              plt.xlabel('log({}) (log({}))'.format(var_name, variable))
+                              plt.ylabel('log(Probability of Lensing) (log(prob_lens))')
+                              plt.title('log(Probability of Lensing) vs log({})'.format(var_name))
+                  else:
+                      print("Please enter a valid scale ('standard', 'log' or 'log vs log')")
+                      return
+                  temp2+=1
+          if not(secondary_variable_values == ['empty']):
+              plt.legend()
+          return plt.show()
